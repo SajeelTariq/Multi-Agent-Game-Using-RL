@@ -126,11 +126,14 @@ python -c "from modes.training_mode import run; run('dqn')"
 ```bash
 # From main menu → "Human vs AI Race Mode" → pick AI algorithm
 # Controls:
-#   Arrow keys or WASD  → move FireAgent
+#   Arrow keys or WASD  → move WaterAgent (YOU)
 #   W / Space           → jump
 #   R                   → restart after round ends
 #   ESC                 → quit
 ```
+> **Note:** You play as **WaterAgent** (blue). The AI plays as **FireAgent** (red) —
+> the same character it was trained on. Avoid fire hazards, collect water gems,
+> reach your blue door. AI wins if it reaches the red door first or if you die.
 
 ---
 

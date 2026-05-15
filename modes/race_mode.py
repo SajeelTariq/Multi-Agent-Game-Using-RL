@@ -1,16 +1,20 @@
 """
 Mode 2 — Human vs AI Race.
 
-Human   → controls FireAgent  (WASD or Arrow keys)
-AI      → controls WaterAgent (loaded trained model, default DQN)
+Human → controls WaterAgent  (arrow keys / WASD)
+AI    → controls FireAgent   (loaded trained model — same character it was trained on)
 
-Both on the same shared race map. First to reach their door with
-most gems wins. Score = gems * 10 + (winner bonus 50).
+Both on the same shared race map. Each collects their own gems and races to their door.
+
+Win rules:
+  - Reaching your door = WIN for that side (instant win if other hasn't reached yet)
+  - Dying = LOSE for that side (instant loss, other side wins)
+  - If neither reaches door (both die or time up): higher score wins
+  Score = gems * 10 + 50 door bonus
 """
 import sys
 import pygame
 import numpy as np
-from pathlib import Path
 
 from game.engine import GameEngine
 from game.maps import map_race
@@ -20,29 +24,29 @@ from game.tiles import (
 )
 from game.characters import (
     ACTION_NOOP, ACTION_LEFT, ACTION_RIGHT, ACTION_JUMP,
-    CharacterType,
 )
-from rl.env import ElementQuestEnv   # for obs builder
 from rl.train import load_model
 
+MAX_RACE_STEPS = 3000  # ~50 seconds at 60fps
+
 
 # ------------------------------------------------------------------ #
-# Build observation for WaterAgent (mirrors ElementQuestEnv._get_obs)
+# FireAgent observation (same format as rl/env.py — what model was trained on)
 # ------------------------------------------------------------------ #
-def _water_obs(engine: GameEngine) -> np.ndarray:
-    wc   = engine.water_char
+def _fire_obs(engine: GameEngine) -> np.ndarray:
+    fc   = engine.fire_char
     grid = engine.grid
 
-    norm_x  = wc.px / (GRID_COLS * TILE_SIZE)
-    norm_y  = wc.py / (GRID_ROWS * TILE_SIZE)
-    norm_vx = np.clip(wc.vx / 10.0, -1, 1)
-    norm_vy = np.clip(wc.vy / 16.0, -1, 1)
-    on_gnd  = float(wc.on_ground)
+    norm_x  = fc.px / (GRID_COLS * TILE_SIZE)
+    norm_y  = fc.py / (GRID_ROWS * TILE_SIZE)
+    norm_vx = np.clip(fc.vx / 10.0, -1, 1)
+    norm_vy = np.clip(fc.vy / 16.0, -1, 1)
+    on_gnd  = float(fc.on_ground)
 
-    cx = wc.px + 16
-    cy = wc.py + 20
+    cx = fc.px + 16
+    cy = fc.py + 20
 
-    gem_pos = engine.gem_positions(int(Tile.WATER_GEM))
+    gem_pos = engine.gem_positions(int(Tile.FIRE_GEM))
     if gem_pos:
         nearest = min(gem_pos,
                       key=lambda g: abs(cx - g[0]*TILE_SIZE) + abs(cy - g[1]*TILE_SIZE))
@@ -51,7 +55,7 @@ def _water_obs(engine: GameEngine) -> np.ndarray:
     else:
         gem_dx, gem_dy = 0.0, 0.0
 
-    door_pos = engine.gem_positions(int(Tile.WATER_DOOR))
+    door_pos = engine.gem_positions(int(Tile.FIRE_DOOR))
     if door_pos:
         d = door_pos[0]
         door_dx = np.clip((d[0]*TILE_SIZE - cx) / (GRID_COLS*TILE_SIZE), -1, 1)
@@ -59,8 +63,8 @@ def _water_obs(engine: GameEngine) -> np.ndarray:
     else:
         door_dx, door_dy = 0.0, 0.0
 
-    total_w = sum(row.count(int(Tile.WATER_GEM)) for row in engine._base_grid)
-    gems_remaining = len(gem_pos) / max(total_w, 1)
+    total_f = sum(row.count(int(Tile.FIRE_GEM)) for row in engine._base_grid)
+    gems_remaining = len(gem_pos) / max(total_f, 1)
 
     col_c = int(cx // TILE_SIZE)
     row_c = int(cy // TILE_SIZE)
@@ -93,6 +97,53 @@ def _keyboard_action() -> int:
 
 
 # ------------------------------------------------------------------ #
+def _resolve_result(fc, wc, timed_out: bool) -> str:
+    """
+    Return a result message string based on character states.
+    Human = WaterAgent (wc), AI = FireAgent (fc).
+    """
+    ai_won   = fc.at_door
+    human_won = wc.at_door
+    ai_dead   = not fc.alive
+    human_dead = not wc.alive
+
+    ai_score    = fc.gems * 10 + (50 if fc.at_door else 0)
+    human_score = wc.gems * 10 + (50 if wc.at_door else 0)
+
+    # Door reached — door wins over death/score
+    if human_won and not ai_won:
+        return f"YOU WIN!   {human_score} pts  vs  AI {ai_score} pts"
+    if ai_won and not human_won:
+        return f"AI WINS!   AI {ai_score} pts  vs  {human_score} pts"
+    if human_won and ai_won:
+        if human_score >= ai_score:
+            return f"YOU WIN!   {human_score} pts  vs  AI {ai_score} pts"
+        return f"AI WINS!   AI {ai_score} pts  vs  {human_score} pts"
+
+    # Deaths (neither reached door)
+    if human_dead and not ai_dead:
+        return f"AI WINS!  You died.  AI {ai_score} pts  vs  {human_score} pts"
+    if ai_dead and not human_dead:
+        return f"YOU WIN!  AI died.  {human_score} pts  vs  AI {ai_score} pts"
+    if human_dead and ai_dead:
+        if human_score > ai_score:
+            return f"YOU WIN (on points)!  {human_score} vs {ai_score}"
+        if ai_score > human_score:
+            return f"AI WINS (on points)!  AI {ai_score} vs {human_score}"
+        return "DRAW!  Both died with equal score."
+
+    # Time up
+    if timed_out:
+        if human_score > ai_score:
+            return f"TIME UP — YOU WIN!   {human_score} pts  vs  AI {ai_score} pts"
+        if ai_score > human_score:
+            return f"TIME UP — AI WINS!   AI {ai_score} pts  vs  {human_score} pts"
+        return f"TIME UP — DRAW!   {human_score} pts each"
+
+    return ""
+
+
+# ------------------------------------------------------------------ #
 def run(algo_name: str = "dqn"):
     print(f"[Race Mode] Loading AI model ({algo_name.upper()})…")
     ai_model = load_model(algo_name)
@@ -102,14 +153,15 @@ def run(algo_name: str = "dqn"):
 
     pygame.init()
     font    = pygame.font.SysFont('Arial', 18, bold=True)
-    font_lg = pygame.font.SysFont('Arial', 38, bold=True)
+    font_lg = pygame.font.SysFont('Arial', 36, bold=True)
+    font_sm = pygame.font.SysFont('Arial', 14)
     clock   = pygame.time.Clock()
 
-    FRAME_SKIP  = 2   # smoother AI
+    FRAME_SKIP  = 2
     frame_count = 0
     ai_action   = ACTION_NOOP
     result_msg  = ""
-    result_timer = 0
+    timed_out   = False
 
     running = True
     while running:
@@ -121,55 +173,66 @@ def run(algo_name: str = "dqn"):
                     running = False
                 if event.key == pygame.K_r and result_msg:
                     engine.reset()
-                    result_msg   = ""
-                    result_timer = 0
+                    result_msg  = ""
+                    timed_out   = False
+                    frame_count = 0
+                    ai_action   = ACTION_NOOP
+
+        fc = engine.fire_char   # AI
+        wc = engine.water_char  # Human
 
         if not result_msg:
+            # Human controls WaterAgent
             human_action = _keyboard_action()
 
-            # AI decision every FRAME_SKIP frames
-            if frame_count % FRAME_SKIP == 0 and engine.water_char.alive:
-                w_obs    = _water_obs(engine)
-                ai_action, _ = ai_model.predict(w_obs, deterministic=True)
+            # AI controls FireAgent — every FRAME_SKIP frames
+            if frame_count % FRAME_SKIP == 0 and fc.alive and not fc.at_door:
+                obs       = _fire_obs(engine)
+                ai_action, _ = ai_model.predict(obs, deterministic=True)
 
-            engine.step(fire_action=human_action, water_action=int(ai_action))
+            engine.step(fire_action=int(ai_action), water_action=human_action)
             frame_count += 1
 
-            # Check end conditions
-            fc = engine.fire_char
-            wc = engine.water_char
-
+            # --- Win / lose conditions ---
             fire_done  = fc.at_door or not fc.alive
             water_done = wc.at_door or not wc.alive
 
             if fire_done or water_done:
-                fire_score  = fc.gems * 10  + (50 if fc.at_door  else 0)
-                water_score = wc.gems * 10  + (50 if wc.at_door  else 0)
-
-                if fire_score > water_score:
-                    result_msg = f"YOU WIN!  {fire_score} vs {water_score}"
-                elif water_score > fire_score:
-                    result_msg = f"AI WINS!  {water_score} vs {fire_score}"
-                else:
-                    result_msg = f"DRAW!  {fire_score} each"
-                result_timer = 180  # show for 3 seconds then prompt
+                result_msg = _resolve_result(fc, wc, timed_out=False)
+            elif frame_count >= MAX_RACE_STEPS:
+                timed_out  = True
+                result_msg = _resolve_result(fc, wc, timed_out=True)
 
         engine.render()
 
-        # HUD overlay: controls reminder
-        hint = font.render("Arrow/WASD: Move  |  W/Space: Jump  |  R: Restart  |  ESC: Quit",
-                           True, (160, 160, 180))
-        engine.screen.blit(hint, (10, WINDOW_H - 28))
+        # --- Labels: who is who ---
+        label_ai    = font_sm.render("◀ AI (FireAgent)", True, (255, 140, 60))
+        label_human = font_sm.render("WaterAgent (You) ▶", True, (80, 180, 255))
+        engine.screen.blit(label_ai,    (6,  UI_HEIGHT + 4))
+        engine.screen.blit(label_human, (WINDOW_W - label_human.get_width() - 6,
+                                         UI_HEIGHT + 4))
 
-        # Result overlay
+        # --- Controls hint ---
+        hint = font_sm.render(
+            "Arrow/WASD: Move   W/Space: Jump   R: Restart   ESC: Quit",
+            True, (120, 120, 150))
+        engine.screen.blit(hint, (WINDOW_W // 2 - hint.get_width() // 2,
+                                   WINDOW_H - 24))
+
+        # --- Result overlay ---
         if result_msg:
             overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 140))
+            overlay.fill((0, 0, 0, 150))
             engine.screen.blit(overlay, (0, 0))
+
             txt = font_lg.render(result_msg, True, (255, 220, 60))
-            engine.screen.blit(txt, txt.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 - 30)))
-            sub = font.render("Press R to restart or ESC to quit", True, (200, 200, 200))
-            engine.screen.blit(sub, sub.get_rect(center=(WINDOW_W // 2, WINDOW_H // 2 + 30)))
+            engine.screen.blit(txt, txt.get_rect(
+                center=(WINDOW_W // 2, WINDOW_H // 2 - 30)))
+
+            sub = font.render("Press R to play again  |  ESC to quit",
+                               True, (200, 200, 200))
+            engine.screen.blit(sub, sub.get_rect(
+                center=(WINDOW_W // 2, WINDOW_H // 2 + 20)))
 
         pygame.display.flip()
         clock.tick(60)
