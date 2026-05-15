@@ -163,12 +163,16 @@ def main():
                         # Pick algo inside current pygame context, THEN quit for training
                         algo = _pick_algo(screen, clock, font, font_sm)
                         if algo != 'back':
+                            import config as cfg
                             print(f"\nStarting training: {algo.upper()}")
                             print("Tip: run 'python dashboard/app.py' in another terminal for live charts.")
-                            print("     A live preview window will appear every 100 training episodes.")
+                            if cfg.RENDER_TRAINING:
+                                print("     Continuous render window is ON (set RENDER_TRAINING=False in config.py to speed up).")
+                            elif cfg.RENDER_PREVIEW_EVERY > 0:
+                                print(f"     Preview window every {cfg.RENDER_PREVIEW_EVERY} episodes.")
                             pygame.quit()
                             from rl.train import train_algo
-                            train_algo(algo, render_every=100)
+                            train_algo(algo)
                             screen, clock, font, font_sm = _reinit_pygame()
                             font_title = pygame.font.SysFont('Arial', 52, bold=True)
 

@@ -1,18 +1,22 @@
 """
 Train DQN, PPO, and A2C on ElementQuestEnv.
-Logs metrics to training_logs/<algo>_log.csv for live dashboard.
+Logs metrics to training_logs/<algo>_log.csv for the live dashboard.
 
 Usage:
     python rl/train.py --algo dqn
     python rl/train.py --algo ppo
     python rl/train.py --algo a2c
-    python rl/train.py --algo all          # trains all three sequentially
-    python rl/train.py --algo dqn --render-every 100   # live preview every 100 episodes
-    python rl/train.py --reset             # wipe all logs and saved models, then exit
+    python rl/train.py --algo all        # all three sequentially
+    python rl/train.py --reset           # wipe all logs + models, then exit
+
+Render behaviour is controlled by config.py:
+    RENDER_TRAINING      = True   → continuous window, every episode visible
+    RENDER_TRAINING      = False  → headless + periodic preview every N episodes
+    RENDER_PREVIEW_EVERY = N      → preview interval (ignored when RENDER_TRAINING=True)
+    RENDER_FPS           = 300    → FPS cap for render window (0 = uncapped)
 """
 import argparse
 import csv
-import shutil
 import time
 from pathlib import Path
 
@@ -21,6 +25,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 
 from rl.env import ElementQuestEnv
+import config as cfg
 
 MODELS_DIR = Path("rl/models")
 LOGS_DIR   = Path("training_logs")
@@ -95,7 +100,8 @@ class TrainingLogger(BaseCallback):
 
         with open(log_path, 'w', newline='') as f:
             csv.writer(f).writerow([
-                'episode', 'timestep', 'reward', 'ep_length', 'elapsed_s', 'algo'
+                'episode', 'timestep', 'reward',
+                'ep_length', 'elapsed_s', 'algo',
             ])
 
     def _on_step(self) -> bool:
@@ -115,7 +121,9 @@ class TrainingLogger(BaseCallback):
                 ])
 
             if self._episode % 50 == 0:
-                print(f"[{self.algo_name.upper()}] ep {self._episode:4d} | "
+                mode = "🖥 " if cfg.RENDER_TRAINING else "  "
+                print(f"{mode}[{self.algo_name.upper()}] "
+                      f"ep {self._episode:4d} | "
                       f"steps {self.num_timesteps:7d} | "
                       f"reward {self._ep_reward:7.1f}")
             self._ep_reward = 0.0
@@ -123,18 +131,19 @@ class TrainingLogger(BaseCallback):
 
 
 # ------------------------------------------------------------------ #
-# Live render callback
+# Periodic preview callback (used only when RENDER_TRAINING = False)
 # ------------------------------------------------------------------ #
 class LiveRenderCallback(BaseCallback):
     """
-    Every `render_every` training episodes, runs one full episode
-    in a rendered Pygame window so you can watch the agent's current behaviour.
-    Close the preview window or press ESC to skip and keep training.
+    Every `render_every` training episodes, pauses and runs one full
+    episode in a Pygame window with the current model.
+    Close the preview window or press ESC to resume training.
     """
 
-    def __init__(self, render_every: int = 100):
+    def __init__(self, render_every: int, render_fps: int = 60):
         super().__init__()
         self.render_every = render_every
+        self.render_fps   = render_fps
         self._episode     = 0
         self._render_env  = None
 
@@ -148,22 +157,20 @@ class LiveRenderCallback(BaseCallback):
 
     def _run_preview(self):
         import pygame
-        print(f"  ▶ Live preview — episode {self._episode} "
-              f"(close window or ESC to continue training)")
+        print(f"  ▶ Preview — episode {self._episode} "
+              f"(close window or ESC to resume training)")
 
-        # Lazy-init the render env
         if self._render_env is None:
-            self._render_env = ElementQuestEnv(render_mode='human')
+            self._render_env = ElementQuestEnv(
+                render_mode='human', render_fps=self.render_fps)
 
-        # Update window title so it's clear this is a preview
         pygame.display.set_caption(
-            f"Element Quest — Training Preview  [ep {self._episode}]"
-        )
+            f"Element Quest — Preview  [ep {self._episode}]")
 
-        obs, _ = self._render_env.reset()
-        done   = False
-        total_reward = 0.0
-        skipped      = False
+        obs, _  = self._render_env.reset()
+        done    = False
+        skipped = False
+        total_r = 0.0
 
         while not done:
             for event in pygame.event.get():
@@ -177,17 +184,16 @@ class LiveRenderCallback(BaseCallback):
                     skipped = True
                     done    = True
                     break
-
             if done:
                 break
 
             action, _ = self.model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, _ = self._render_env.step(int(action))
-            total_reward += reward
+            obs, r, terminated, truncated, _ = self._render_env.step(int(action))
+            total_r += r
             done = terminated or truncated
 
         if not skipped:
-            print(f"  ✓ Preview done — reward: {total_reward:.1f}")
+            print(f"  ✓ Preview done — reward: {total_r:.1f}")
 
     def _on_training_end(self):
         if self._render_env is not None:
@@ -196,21 +202,16 @@ class LiveRenderCallback(BaseCallback):
 
 
 # ------------------------------------------------------------------ #
-# Reset helper
+# Reset
 # ------------------------------------------------------------------ #
 def reset_all():
-    """Delete all training logs and saved models."""
     deleted = []
     for f in LOGS_DIR.glob("*.csv"):
-        f.unlink()
-        deleted.append(str(f))
+        f.unlink(); deleted.append(str(f))
     for f in MODELS_DIR.glob("*.zip"):
-        f.unlink()
-        deleted.append(str(f))
+        f.unlink(); deleted.append(str(f))
     if deleted:
-        print("Deleted:")
-        for d in deleted:
-            print(f"  {d}")
+        print("Deleted:"); [print(f"  {d}") for d in deleted]
     else:
         print("Nothing to delete — already clean.")
 
@@ -218,26 +219,40 @@ def reset_all():
 # ------------------------------------------------------------------ #
 # Train one algorithm
 # ------------------------------------------------------------------ #
-def train_algo(algo_name: str, render_every: int = 0):
-    print(f"\n{'='*50}")
+def train_algo(algo_name: str):
+    print(f"\n{'='*52}")
     print(f"  Training {algo_name.upper()}")
-    if render_every > 0:
-        print(f"  Live preview every {render_every} episodes")
-    print(f"{'='*50}")
 
-    cfg        = ALGO_CONFIGS[algo_name]
+    render_training = cfg.RENDER_TRAINING
+    render_fps      = cfg.RENDER_FPS
+    preview_every   = cfg.RENDER_PREVIEW_EVERY
+
+    if render_training:
+        print(f"  Render: CONTINUOUS window  (FPS cap: "
+              f"{'none' if render_fps == 0 else render_fps})")
+    elif preview_every > 0:
+        print(f"  Render: preview every {preview_every} episodes")
+    else:
+        print(f"  Render: OFF (headless)")
+    print(f"{'='*52}")
+
+    c          = ALGO_CONFIGS[algo_name]
     log_path   = LOGS_DIR   / f"{algo_name}_log.csv"
     model_path = MODELS_DIR / f"{algo_name}_model"
 
-    env   = Monitor(ElementQuestEnv())
-    model = cfg['cls'](env=env, **cfg['kwargs'])
+    if render_training:
+        env = Monitor(ElementQuestEnv(render_mode='human', render_fps=render_fps))
+        callbacks = [TrainingLogger(algo_name, log_path)]
+    else:
+        env = Monitor(ElementQuestEnv())
+        callbacks = [TrainingLogger(algo_name, log_path)]
+        if preview_every > 0:
+            callbacks.append(LiveRenderCallback(
+                render_every=preview_every, render_fps=60))
 
-    callbacks = [TrainingLogger(algo_name, log_path)]
-    if render_every > 0:
-        callbacks.append(LiveRenderCallback(render_every=render_every))
-
+    model = c['cls'](env=env, **c['kwargs'])
     model.learn(
-        total_timesteps=cfg['total_timesteps'],
+        total_timesteps=c['total_timesteps'],
         callback=CallbackList(callbacks),
     )
 
@@ -250,12 +265,12 @@ def train_algo(algo_name: str, render_every: int = 0):
 # Load a saved model
 # ------------------------------------------------------------------ #
 def load_model(algo_name: str):
-    cfg        = ALGO_CONFIGS[algo_name]
+    c          = ALGO_CONFIGS[algo_name]
     model_path = MODELS_DIR / f"{algo_name}_model"
     if not model_path.with_suffix('.zip').exists():
         raise FileNotFoundError(
             f"No saved model at {model_path}.zip — train first.")
-    return cfg['cls'].load(str(model_path))
+    return c['cls'].load(str(model_path))
 
 
 # ------------------------------------------------------------------ #
@@ -263,24 +278,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', default='dqn',
                         choices=['dqn', 'ppo', 'a2c', 'all'])
-    parser.add_argument('--render-every', type=int, default=0,
-                        help='Show a live preview window every N training episodes. '
-                             '0 = disabled (default).')
     parser.add_argument('--reset', action='store_true',
-                        help='Delete all training logs and saved models, then exit.')
+                        help='Delete all training logs and saved models.')
     args = parser.parse_args()
 
     if args.reset:
         reset_all()
         return
 
-    render_every = args.render_every
-
     if args.algo == 'all':
         for name in ['dqn', 'ppo', 'a2c']:
-            train_algo(name, render_every=render_every)
+            train_algo(name)
     else:
-        train_algo(args.algo, render_every=render_every)
+        train_algo(args.algo)
 
 
 if __name__ == '__main__':
