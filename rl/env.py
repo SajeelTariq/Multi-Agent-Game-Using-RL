@@ -44,8 +44,8 @@ class ElementQuestEnv(gym.Env):
                  frame_skip: int = 4, render_fps: int = 60):
         super().__init__()
         if map_module is None:
-            from game.maps import map_training
-            map_module = map_training
+            from game.maps import map_race
+            map_module = map_race
 
         self.map_module   = map_module
         self.render_mode  = render_mode
